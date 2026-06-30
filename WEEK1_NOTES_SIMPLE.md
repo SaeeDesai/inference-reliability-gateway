@@ -65,6 +65,9 @@ task, go help someone else, come back when it's ready.
 - **Contagion rule:** once a path is async, everything it waits on must also be async — one
   old "blocking" call freezes the event loop and cancels the benefit. (That's the next point.)
 
+- **📊 My result (Day 3):** 20 concurrent 0.5s calls → 0.50s async vs 10.07s blocking =
+20.1× throughput (39.9 vs 2.0 req/s). Proof, not theory.
+
 ## 4. Talking to the kitchen — httpx, not requests
 
 **Plain idea:** to call the AI models you need an HTTP client (a "phone"). The popular one,
