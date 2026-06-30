@@ -3,9 +3,10 @@ from pydantic import BaseModel, Field
 class InferRequest(BaseModel):
     task: str = Field(..., description="Kind of work, e.g. 'chat' or 'sentiment'")
     input: str = Field(..., description="The user's text")
-    options: dict = Field(default_factory=dict)
+    options: dict = Field(default_factory=dict)  # e.g. {"model": "large"} to force a tier
 
 class InferResponse(BaseModel):
     output: str
     backend: str
     cached: bool = False
+    route: str | None = None    # which tier + why it was chosen

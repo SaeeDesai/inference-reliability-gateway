@@ -1,31 +1,35 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from src.schemas import InferRequest, InferResponse
-from src.backends.mock import MockBackend
 from src.backends.groq import GroqBackend
 from src.backends.resilient import ResilientBackend, CircuitOpenError
 from src.cache import RedisCache
+from src.ratelimit import RateLimiter, RateLimitExceeded
+from src.router import ComplexityRouter
 
-mock = MockBackend()
-groq = GroqBackend(model="openai/gpt-oss-20b", name="gpt-oss-20b")
-backend = ResilientBackend(groq, timeout=15, retries=2, backoff=0.5,
-                           failure_threshold=3, cooldown=10)
+# Two real backends: cheap/fast small, pricier/slower large — each wrapped in resilience.
+groq_small = GroqBackend(model="openai/gpt-oss-20b", name="gpt-oss-20b")
+groq_large = GroqBackend(model="openai/gpt-oss-120b", name="gpt-oss-120b")
+small = ResilientBackend(groq_small, timeout=15, retries=2, failure_threshold=3, cooldown=10)
+large = ResilientBackend(groq_large, timeout=30, retries=2, failure_threshold=3, cooldown=10)
+
+router = ComplexityRouter(small=small, large=large, threshold=3)
 cache = RedisCache()
+limiter = RateLimiter(limit=5, window=10)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    try:
-        await cache.ping()           # warn-only: Redis is optional
-    except Exception:
-        pass
     yield
-    await groq.aclose()
-    try:
-        await cache.aclose()
-    except Exception:
-        pass
+    for closeable in (groq_small, groq_large, cache, limiter):
+        try:
+            await closeable.aclose()
+        except Exception:
+            pass
+
 
 app = FastAPI(title="Inference Reliability Gateway", lifespan=lifespan)
+
 
 @app.get("/health")
 async def health():
@@ -36,21 +40,28 @@ async def health():
         redis_status = "down"
     return {"status": "ok", "redis": redis_status}
 
-@app.post("/v1/infer", response_model=InferResponse)
-async def infer(request: InferRequest):
-    key = cache.make_key(request.task, request.input, request.options)
 
-    # 1) Try cache (a cache error must NOT break the request -> treat as a miss)
+@app.post("/v1/infer", response_model=InferResponse)
+async def infer(body: InferRequest, req: Request):
+    client_id = req.headers.get("x-client-id") or (req.client.host if req.client else "unknown")
+
+    try:
+        await limiter.check(client_id)
+    except RateLimitExceeded:
+        raise HTTPException(status_code=429, detail="Too many requests")
+    except Exception:
+        pass
+
+    key = cache.make_key(body.task, body.input, body.options)
     try:
         cached = await cache.get(key)
     except Exception:
         cached = None
     if cached is not None:
-        return InferResponse(output=cached, backend=backend.name, cached=True)
+        return InferResponse(output=cached, backend="cache", cached=True)
 
-    # 2) Miss -> call the backend (with all of Week 1's resilience)
     try:
-        output = await backend.predict(request.input)
+        result = await router.complete(body.task, body.input, body.options)
     except CircuitOpenError:
         raise HTTPException(status_code=503, detail="Backend unavailable (circuit open)")
     except TimeoutError:
@@ -58,10 +69,10 @@ async def infer(request: InferRequest):
     except Exception:
         raise HTTPException(status_code=502, detail="Backend error")
 
-    # 3) Store for next time (best-effort)
     try:
-        await cache.set(key, output)
+        await cache.set(key, result.output)
     except Exception:
         pass
 
-    return InferResponse(output=output, backend=backend.name, cached=False)
+    return InferResponse(output=result.output, backend=result.backend,
+                         cached=False, route=result.route)
