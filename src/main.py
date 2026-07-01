@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, HTTPException, Request, Response
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from src.schemas import InferRequest, InferResponse
 from src.backends.groq import GroqBackend
@@ -11,8 +12,8 @@ from src.backends.resilient import ResilientBackend, CircuitOpenError
 from src.cache import RedisCache
 from src.ratelimit import RateLimiter, RateLimitExceeded
 from src.router import ComplexityRouter
+from src.metrics import REQUESTS, LATENCY, IN_FLIGHT
 
-# --- structured JSON logging ---
 structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
@@ -23,7 +24,6 @@ structlog.configure(
 )
 logger = structlog.get_logger()
 
-# --- backends, router, cache, limiter ---
 groq_small = GroqBackend(model="openai/gpt-oss-20b", name="gpt-oss-20b")
 groq_large = GroqBackend(model="openai/gpt-oss-120b", name="gpt-oss-120b")
 small = ResilientBackend(groq_small, timeout=15, retries=2, failure_threshold=3, cooldown=10)
@@ -56,6 +56,11 @@ async def health():
     return {"status": "ok", "redis": redis_status}
 
 
+@app.get("/metrics")
+async def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/v1/infer", response_model=InferResponse)
 async def infer(body: InferRequest, req: Request, response: Response):
     request_id = uuid.uuid4().hex[:8]
@@ -64,8 +69,8 @@ async def infer(body: InferRequest, req: Request, response: Response):
     client_id = req.headers.get("x-client-id") or (req.client.host if req.client else "unknown")
     status, backend_name, cached, route = 200, None, False, None
 
+    IN_FLIGHT.inc()
     try:
-        # 1) rate limit (fail open if Redis down)
         try:
             await limiter.check(client_id)
         except RateLimitExceeded:
@@ -74,7 +79,6 @@ async def infer(body: InferRequest, req: Request, response: Response):
         except Exception:
             pass
 
-        # 2) cache
         key = cache.make_key(body.task, body.input, body.options)
         try:
             hit = await cache.get(key)
@@ -84,7 +88,6 @@ async def infer(body: InferRequest, req: Request, response: Response):
             backend_name, cached = "cache", True
             return InferResponse(output=hit, backend="cache", cached=True)
 
-        # 3) backend via router
         try:
             result = await router.complete(body.task, body.input, body.options)
         except CircuitOpenError:
@@ -106,14 +109,14 @@ async def infer(body: InferRequest, req: Request, response: Response):
         return InferResponse(output=result.output, backend=result.backend,
                              cached=False, route=result.route)
     finally:
+        latency = time.perf_counter() - start
+        IN_FLIGHT.dec()
+        label = backend_name or "none"
+        LATENCY.labels(backend=label).observe(latency)
+        REQUESTS.labels(backend=label, status=str(status), cached=str(cached).lower()).inc()
         logger.info(
             "infer",
-            request_id=request_id,
-            task=body.task,
-            client=client_id,
-            backend=backend_name,
-            cached=cached,
-            route=route,
-            status=status,
-            latency_ms=round((time.perf_counter() - start) * 1000, 2),
+            request_id=request_id, task=body.task, client=client_id,
+            backend=backend_name, cached=cached, route=route,
+            status=status, latency_ms=round(latency * 1000, 2),
         )
